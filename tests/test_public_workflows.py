@@ -343,3 +343,106 @@ async def test_public_multistep_model_recovery_reuses_paid_results(billed, monke
         )
     finally:
         await second_router.close()
+
+
+# --- Customer Churn Signal Detector tests ---
+
+
+@pytest.mark.parametrize("invalid_ids", [False, True])
+async def test_churn_detector_extracts_and_validates_complaints(invalid_ids):
+    module, definition = example("example.churn_signal_detector")
+    spec = validate_code_definition(definition)
+    calls = []
+
+    async def generate(**payload):
+        request_contract(spec, payload)
+        calls.append(payload)
+        if payload["step"] == "extract_complaints":
+            output = {
+                "complaints": [
+                    {
+                        "id": 99 if invalid_ids else 0,
+                        "source": "ticket",
+                        "category": "bug",
+                        "severity": "critical",
+                        "summary": "App crashes on mobile",
+                    },
+                    {
+                        "id": 99 if invalid_ids else 1,
+                        "source": "ticket",
+                        "category": "bug",
+                        "severity": "high",
+                        "summary": "App freezes during upload",
+                    },
+                    {
+                        "id": 99 if invalid_ids else 2,
+                        "source": "review",
+                        "category": "missing_feature",
+                        "severity": "medium",
+                        "summary": "No Slack integration",
+                    },
+                ]
+            }
+        else:
+            output = {
+                "risks": [
+                    {
+                        "rank": 1,
+                        "issue": "Mobile stability issues",
+                        "category": "bug",
+                        "mentions": 2,
+                        "top_severity": "critical",
+                        "recommendation": "Prioritize crash fixes in the next sprint",
+                    },
+                    {
+                        "rank": 2,
+                        "issue": "Missing Slack integration",
+                        "category": "missing_feature",
+                        "mentions": 1,
+                        "top_severity": "medium",
+                        "recommendation": "Evaluate adding Slack integration to the roadmap",
+                    },
+                ]
+            }
+        jsonschema.validate(output, payload["output_schema"])
+        return {"parsed": output, "text": json.dumps(output)}
+
+    context = SimpleNamespace(models=SimpleNamespace(generate=generate))
+    inputs = {
+        "support_tickets": ["App crashes on mobile", "App freezes during upload"],
+        "reviews": ["No Slack integration available"],
+    }
+    if invalid_ids:
+        with pytest.raises(ValueError, match="unknown input ID|Duplicate complaint ID"):
+            await module.run(context, inputs)
+        assert len(calls) == 1
+    else:
+        result = await module.run(context, inputs)
+        assert [c["step"] for c in calls] == ["extract_complaints", "recommend_actions"]
+        validate_code_result(json.dumps(result).encode(), spec)
+        assert "Mobile stability issues" in result["content"]
+        assert "Mentions:** 2" in result["content"]
+        assert result["path"] == "reports/CHURN_SIGNALS.md"
+
+
+async def test_churn_detector_handles_no_complaints():
+    module, _ = example("example.churn_signal_detector")
+    calls = []
+
+    async def generate(**payload):
+        calls.append(payload)
+        output = {"complaints": []}
+        jsonschema.validate(output, payload["output_schema"])
+        return {"parsed": output, "text": json.dumps(output)}
+
+    context = SimpleNamespace(models=SimpleNamespace(generate=generate))
+    result = await module.run(context, {"support_tickets": ["Everything is great!"]})
+    assert len(calls) == 1
+    assert "No complaints detected" in result["content"]
+
+
+async def test_churn_detector_rejects_empty_input():
+    module, _ = example("example.churn_signal_detector")
+    context = SimpleNamespace(models=SimpleNamespace(generate=None))
+    with pytest.raises(ValueError, match="at least one feedback item"):
+        await module.run(context, {"support_tickets": []})
